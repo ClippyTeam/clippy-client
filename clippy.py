@@ -1,8 +1,10 @@
 import base64
+import ctypes
 import os
 import platform
 import subprocess
 import time
+from ctypes import wintypes
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -12,6 +14,149 @@ import typer
 app = typer.Typer(add_completion=False)
 
 CONFIG_PATH_DEFAULT = os.path.expanduser("~/.config/clippy.toml")
+
+# ---------------- Windows low-level helpers ----------------
+
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
+
+VK_CONTROL = 0x11
+VK_V = 0x56
+VK_C = 0x43
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", wintypes.ULONG_PTR),
+    ]
+
+
+class INPUT(ctypes.Structure):
+    class _I(ctypes.Union):
+        _fields_ = [("ki", KEYBDINPUT)]
+
+    _anonymous_ = ("i",)
+    _fields_ = [("type", wintypes.DWORD), ("i", _I)]
+
+
+def _send_key(vk: int, keyup: bool = False):
+    flags = KEYEVENTF_KEYUP if keyup else 0
+    inp = INPUT(
+        type=INPUT_KEYBOARD,
+        ki=KEYBDINPUT(wVk=vk, wScan=0, dwFlags=flags, time=0, dwExtraInfo=0),
+    )
+    n = user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+    if n != 1:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def win_send_ctrl_combo(vk_letter: int):
+    _send_key(VK_CONTROL, False)
+    _send_key(vk_letter, False)
+    _send_key(vk_letter, True)
+    _send_key(VK_CONTROL, True)
+
+
+def win_type_text(text: str):
+    # Paste by typing Unicode keystrokes, clipboard not used.
+    for ch in text:
+        code = ord(ch)
+        down = INPUT(
+            type=INPUT_KEYBOARD,
+            ki=KEYBDINPUT(
+                wVk=0, wScan=code, dwFlags=KEYEVENTF_UNICODE, time=0, dwExtraInfo=0
+            ),
+        )
+        up = INPUT(
+            type=INPUT_KEYBOARD,
+            ki=KEYBDINPUT(
+                wVk=0,
+                wScan=code,
+                dwFlags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+                time=0,
+                dwExtraInfo=0,
+            ),
+        )
+        user32.SendInput(1, ctypes.byref(down), ctypes.sizeof(down))
+        user32.SendInput(1, ctypes.byref(up), ctypes.sizeof(up))
+
+
+def win_get_clipboard_text() -> str:
+    if not user32.OpenClipboard(None):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        h = user32.GetClipboardData(CF_UNICODETEXT)
+        if not h:
+            return ""
+        p = kernel32.GlobalLock(h)
+        if not p:
+            return ""
+        try:
+            return ctypes.wstring_at(p)
+        finally:
+            kernel32.GlobalUnlock(h)
+    finally:
+        user32.CloseClipboard()
+
+
+def win_set_clipboard_text(text: str) -> None:
+    if not user32.OpenClipboard(None):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        user32.EmptyClipboard()
+        data = text.encode("utf-16le") + b"\x00\x00"
+        h_mem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+        if not h_mem:
+            raise ctypes.WinError(ctypes.get_last_error())
+        p = kernel32.GlobalLock(h_mem)
+        if not p:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            ctypes.memmove(p, data, len(data))
+        finally:
+            kernel32.GlobalUnlock(h_mem)
+        if not user32.SetClipboardData(CF_UNICODETEXT, h_mem):
+            raise ctypes.WinError(ctypes.get_last_error())
+        # do not free h_mem after SetClipboardData, OS owns it
+    finally:
+        user32.CloseClipboard()
+
+
+def win_capture_selected_text_preserve_clipboard() -> str:
+    original = ""
+    try:
+        original = win_get_clipboard_text()
+    except Exception:
+        original = ""
+
+    # Trigger copy in the focused app
+    win_send_ctrl_combo(VK_C)
+    time.sleep(0.03)
+
+    new_text = ""
+    try:
+        new_text = win_get_clipboard_text()
+    except Exception:
+        new_text = ""
+
+    # Restore clipboard
+    try:
+        win_set_clipboard_text(original)
+    except Exception:
+        pass
+
+    return new_text
 
 
 @dataclass
@@ -166,35 +311,14 @@ def choose_clip(cfg: Config, items: List[Dict[str, Any]]) -> Optional[Dict[str, 
 
 
 @app.command()
-@app.command()
 def send(config: str = typer.Option(CONFIG_PATH_DEFAULT, "--config")):
     cfg = load_config(config)
 
     try:
         sysname = platform.system().lower()
-        text = ""
-
-        if sysname == "linux" and shutil_which("xclip") and shutil_which("xdotool"):
-            # 1) Prefer PRIMARY selection (no clipboard)
-            text = x11_get_primary_text().strip("\n")
-
-            if not text:
-                # 2) Fallback: safe copy using CLIPBOARD, but restore it afterwards
-                old_clip = ""
-                try:
-                    old_clip = x11_get_clipboard_text()
-                except Exception:
-                    old_clip = ""
-
-                x11_ctrl_c()
-                time.sleep(0.03)  # let app update clipboard
-                text = x11_get_clipboard_text().strip("\n")
-
-                # restore
-                x11_set_clipboard_text(old_clip)
-
+        if sysname == "windows":
+            text = win_capture_selected_text_preserve_clipboard()
         else:
-            # non-linux / non-x11 fallback: use existing clipboard_get_text
             text = clipboard_get_text()
 
         if not text:
@@ -213,9 +337,7 @@ def send(config: str = typer.Option(CONFIG_PATH_DEFAULT, "--config")):
             headers=auth_headers(cfg),
             timeout=2,
         )
-
     except Exception:
-        # hotkey should not pop errors
         pass
 
 
@@ -332,6 +454,11 @@ def fetch(config: str = typer.Option(CONFIG_PATH_DEFAULT, "--config")):
     text = raw.decode("utf-8", errors="replace")
 
     typer.echo("fetch: writing clipboard...")
+
+    if platform.system().lower() == "windows":
+        # paste without touching clipboard
+        win_type_text(text)
+        return
 
     # IMPORTANT: Wayland wl-copy can block if you wait on it.
     # Use communicate() to feed stdin and return.
