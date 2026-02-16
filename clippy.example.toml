@@ -1,0 +1,7 @@
+server_url = "http://localhost:8000
+"
+token = "change_me_to_a_long_random_string"
+device_id = "mydevice"
+device_name = "My Device"
+priority = ["work-pc","laptop","mydevice"]
+use_latest_per_device = true
